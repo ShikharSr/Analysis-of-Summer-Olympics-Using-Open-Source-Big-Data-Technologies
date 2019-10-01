@@ -1,0 +1,137 @@
+------------------------------------------------------------------------------ MySQL ----------------------------------------------------------------------------
+
+create database PDA_Project;
+
+use PDA_Project;
+
+create table olympics(ID int primary key, Name varchar(255), Sex varchar(10), Age double, Height double, Weight double, Team varchar(255), NOC varchar(50), Games varchar(255), Year varchar(10), Season varchar(20), City varchar(50), Sport varchar(255), Event varchar(255), Medal varchar(50));
+
+
+load data local infile '/home/hduser/olympic.txt' into table olympics fields terminated by ',' lines terminated by '\n' IGNORE 1 LINES;
+
+
+--------------------------------------------------------------------------- Data Sqooped from MySQL to HDFS -------------------------------------------------------------
+
+
+sqoop import --connect jdbc:mysql://127.0.0.1/PDA_Project --username root --password shikhar96969 --table olympics --target-dir /sqoop/season_filter
+
+
+--------------------------------------------------------------------------- Filter Season Using MapReduce ---------------------------------------------------------------
+
+
+./filtering.sh (shell script and jar file attached)
+
+
+------------------------------------------------------------------ Removing Leading Spaces and Putting Headers and Removing First Line -------------------------------------------------------
+
+
+awk '{$1=$1;print}' part-r-00000 > LeadingSpacesRemoved
+
+{ echo "ID,Name,Sex,Age,Height,Weight,Team,NOC,Games,Year,Season,City,Sport,Event,Medal"; cat LeadingSpacesRemoved; } > mapreduceOP
+
+sed -i '1d' mapreduceOP
+
+
+-------------------------------------------------------------------------- Loading MapReduce Processed File in HDFS for HBASE ----------------------------------------------------------------
+
+
+/usr/local/hadoop/bin/hdfs dfs -mkdir /HBASE/
+
+/usr/local/hadoop/bin/hdfs dfs -copyFromLocal /home/hduser/OlympicFiltering/output/mapreduceOP /HBASE/
+
+
+--------------------------------------------------------------------------------------- Starting HBASE and Creating HBASE Table -------------------------------------------------------------------------
+
+
+cd /usr/local/hbase/bin/
+
+./start-hbase.sh
+
+hbase shell
+
+create 'Olympics', 'olym'
+
+
+-------------------------------------------------------------------------- Pulling Data into HBASE from HDFS -------------------------------------------------------------------------------------
+
+
+hbase org.apache.hadoop.hbase.mapreduce.ImportTsv -Dimporttsv.separator=',' -Dimporttsv.columns='HBASE_ROW_KEY, olym:ID, olym:Name, olym:Sex, olym:Age, olym:Height, olym:Weight, olym:Team, olym:NOC, olym:Games, olym:Year, olym:Season, olym:City, olym:Sport, olym:Event, olym:Medal' Olympics /HBASE/mapreduceOP
+
+
+---------------------------------------------- Creating Another Table in MySQL only Summer Olympics (which was filtered by MapReduce) -------------------------------------------------------------
+
+
+mysql -uroot -p
+
+use PDA_Project;
+
+create table summer_olympics(ID int primary key, Name varchar(255), Sex varchar(10), Age double, Height double, Weight double, Team varchar(255), NOC varchar(50), Games varchar(255), Year varchar(10), Season varchar(50), City varchar(50), Sport varchar(255), Event varchar(255), Medal varchar(50));
+
+load data local infile '/home/hduser/OlympicFiltering/output/mapreduceOP' into table summer_olympics fields terminated by ',' lines terminated by '\n' IGNORE 1 LINES;
+
+
+------------------------------------------------------------------------- ERROR(SQOOP_MYSQL_HIVE): SQOOP COMMANDS THAT THREW ERROR -----------------------------------------------------------------------
+
+
+/////Creating hive table while sqooping from mysql
+sqoop import --connect jdbc:mysql://127.0.0.1/PDA_Project --username root --password shikhar96969 --table summer_olympics --hive-import --create-hive-table --hive-table Summer_Olympics
+
+////Sqooping data from MySQL in already existing hive table
+sqoop import --connect jdbc:mysql://127.0.0.1/PDA_Project --username root --password shikhar96969 --table summer_olympics --hive-import --hive-table summer_olympics --hive-database PDA_Project --columns "ID,Name,Sex,Age,Height,Weight,Team,NOC,Games,Year,Season,City,Sport,Event,Medal"
+
+
+------------------------------------------------------------------------------------ Manually Pulling Data in Hive --------------------------------------------------------------------------------------
+
+
+CREATE TABLE IF NOT EXISTS summer_olympics(ID int, Name varchar(255), Sex varchar(10), Age double, Height double, Weight double, Team varchar(255), NOC varchar(50), Games varchar(255), Year varchar(10), Season varchar(50), City varchar(50), Sport varchar(255), Event varchar(255), Medal varchar(50)) ROW FORMAT DELIMITED ​FIELDS TERMINATED BY '\054';​
+
+​LOAD DATA LOCAL INPATH '/home/hduser/OlympicFiltering/output/mapreduceOP' INTO TABLE summer_olympics;​
+
+
+-------------------------------------------------------------------------------------------- Hive Queries -----------------------------------------------------------------------------------------------
+
+
+///Query 1
+create table num_of_sports_by_olympic as select city, year, count(distinct sport) as no_of_sports from summer_olympics group by city, year;
+
+///Query 2
+create table num_of_players_by_olympic as select city, year, count(distinct name) as no_of_players from summer_olympics group by city, year;
+
+///Query 3
+create view sports_and_players_by_olympic  as select a.city, a.year, a.no_of_sports, b.no_of_players from num_of_sports_by_olympic a inner join num_of_players_by_olympic b on a.city=b.city and a.year=b.year;
+
+///Query 4
+create view Last_4_Olympics as select * from summer_olympics where year in ('2016','2012','2008','2004');
+
+
+-------------------------------------------------------------------------------------------- Pig Scripts on MapReduce O/P Data -------------------------------------------------------------------
+
+
+///Query 1 (Count of Events)
+olympic_data = LOAD '/home/hduser/OlympicFiltering/output/mapreduceOP' USING PigStorage(',') AS (ID:INT,Name:chararray,Sex:chararray,Age:INT,Height:INT,Weight:INT,Team:chararray,NOC:chararray,Games:chararray,Year:chararray,Season:chararray,City:chararray,Sport:chararray,Event:chararray,Medal:chararray);
+
+city_year_group = GROUP olympic_data BY (City,Year);
+
+output_record = FOREACH city_year_group GENERATE group, COUNT(olympic_data.Event);
+
+store output_record into '/usr/local/pig/pig_output1';
+
+///Query 2 (Avg. Age)
+olympic_data = LOAD '/home/hduser/OlympicFiltering/output/mapreduceOP' USING PigStorage(',') AS (ID:INT,Name:chararray,Sex:chararray,Age:INT,Height:INT,Weight:INT,Team:chararray,NOC:chararray,Games:chararray,Year:chararray,Season:chararray,City:chararray,Sport:chararray,Event:chararray,Medal:chararray);
+
+city_year_group = GROUP olympic_data BY (City,Year);
+
+output_record = FOREACH city_year_group GENERATE group, AVG(olympic_data.Age);
+
+store output_record into '/usr/local/pig/pig_output2';
+
+///Query 3 (No. of Gold Medals by Gender)
+olympic_data = LOAD '/home/hduser/OlympicFiltering/output/mapreduceOP' USING PigStorage(',') AS (ID:INT,Name:chararray,Sex:chararray,Age:INT,Height:INT,Weight:INT,Team:chararray,NOC:chararray,Games:chararray,Year:chararray,Season:chararray,City:chararray,Sport:chararray,Event:chararray,Medal:chararray);
+
+filter_data_goldmedal = FILTER olympic_data BY Medal == 'Gold';
+
+city_year_group = GROUP filter_data_goldmedal BY (City,Year,Sex);
+
+output_record = FOREACH city_year_group GENERATE group, COUNT(filter_data_goldmedal.Medal);
+
+store output_record into '/usr/local/pig/pig_output3';
